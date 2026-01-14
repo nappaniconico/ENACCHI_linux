@@ -14,3 +14,4 @@ wheels/
 output
 temp_git
 llama-server*
+!llama.cpp/build/bin/llama-server
