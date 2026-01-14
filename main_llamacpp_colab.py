@@ -511,7 +511,7 @@ def main():
     signal.signal(signal.SIGTERM,signal_handler)
     try:
         demo = build_ui()
-        demo.launch(inbrowser=True)
+        demo.launch(inbrowser=True,share=True)
     finally:
         cleanup()
 
