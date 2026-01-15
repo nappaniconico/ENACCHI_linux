@@ -8,6 +8,11 @@ llama.cpp を使って小説生成を行う Gradio アプリです。
 - Python 3.11 以上
 - NVIDIA GeForce RTX 20 / 30 / 40 番台で動作確認済み
 
+## Google Colab版の使い方  
+1. [ENACCHI.ipynb](https://github.com/nappaniconico/ENACCHI_linux/blob/main/ENACCHI.ipynb)のページに移動し、右上の下矢印ボタンを押してダウンロードする  
+2. [自身のGoogleDrive](https://drive.google.com/drive/my-drive)にダウンロードしたファイルをドラッグアンドドロップする  
+3. アップロードしたファイルをクリックして開き、移動先のColab内の指示に従って操作する  
+
 ## インストール  
 ### ワンステップインストール (おすすめ)  
   
@@ -17,18 +22,24 @@ llama.cpp を使って小説生成を行う Gradio アプリです。
 
 #### venv を使う場合  
 1. Pythonがインストール済みであることを確認する
-2. アプリを配置したいフォルダでコマンドプロンプトを起動し、`git clone https://github.com/nappaniconico/EasyNovelAssistantosuChitsu.git`を実行する
+2. アプリを配置したいフォルダでコマンドプロンプトを起動し、`git clone https://github.com/nappaniconico/ENACCHI_linux.git`を実行する  
+3. ENACCHI_linuxディレクトリ内で`python3 -m venv .venv`を実行  
+4. `source llamacpp_build.sh`を実行  
+5. `launch.sh`を実行  
 
 
-#### uv を使う場合 (おすすめ)  
-1. Pythonがインストール済みであることを確認する
-2. アプリを配置したいフォルダでコマンドプロンプトを起動し、`git clone https://github.com/nappaniconico/EasyNovelAssistantosuChitsu.git`を実行する
- 
+#### uv を使う場合 (おすすめ)   
+1. uvがインストール済みであることを確認する
+2. アプリを配置したいフォルダでコマンドプロンプトを起動し、`git clone https://github.com/nappaniconico/ENACCHI_linux.git`を実行する
+3. ENACCHI_linuxディレクトリ内で`uv sync`を実行
+4. `source llamacpp_build.sh`を実行  
+5. `launch.sh`を実行  
 
 起動
 ----
-`launch.`をクリックして実行  
-しばらくすると自動的にブラウザが起動します。
+`source launch.sh`を実行  
+しばらくすると自動的にブラウザが起動します。  
+起動しない場合は[このリンク](http://127.0.0.1:7860)を開きます。
 
 基本的な使い方
 --------------
