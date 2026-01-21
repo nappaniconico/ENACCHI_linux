@@ -12,6 +12,7 @@ import sys
 import random
 import subprocess
 import re
+import argparse
 
 import gradio as gr
 
@@ -555,16 +556,19 @@ def print_message(text: str):
     print(text)
     return None
 
-def main():
+def main(colab: bool):
     signal.signal(signal.SIGTERM,signal_handler)
     try:
         ensure_koboldcpp()
         demo = build_ui()
         threading.Thread(target=print_message,args=("-"*80+"\nブラウザが自動的に開かない場合は以下のURLをCtrl+クリックしてください\n"+("-"*80),)).run()
-        demo.launch(inbrowser=True)
+        demo.launch(inbrowser=True,share=colab)
     finally:
         cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    Parser=argparse.ArgumentParser()
+    Parser.add_argument("--colab",action="store_true")
+    args=Parser.parse_args()
+    main(args.colab)
