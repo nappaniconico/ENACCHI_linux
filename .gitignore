@@ -13,6 +13,4 @@ wheels/
 *.gguf
 output
 temp_git
-llama-server*
-!llama.cpp/build/bin/llama-server
 koboldcpp
