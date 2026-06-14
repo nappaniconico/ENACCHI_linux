@@ -7,6 +7,8 @@ import os
 import threading
 import signal
 import requests
+import glob
+import socket
 from cipher import SimpleStringCipher
 from chat_template import Chat_templates
 
@@ -18,6 +20,7 @@ from chat_template import Chat_templates
 class KoboldCppConfig:
     base_url: str = "http://127.0.0.1:5001"
     timeout_sec: int = 180
+    kobold_path: str = "koboldcpp"
 
 
 class KoboldCppBackend:
@@ -31,12 +34,26 @@ class KoboldCppBackend:
         self.temps=Chat_templates()
         self.config = config
         self._proc: Optional[subprocess.Popen] = None
+        self.comp_proc: Optional[subprocess.Popen] = None
         self.not_first_gen=False
         self.ssc=SimpleStringCipher("my-password")
         if os.path.exists("models/llm.json"):
             with open("models/llm.json",mode="r",encoding="utf-8")as f:
                 self.models=json.load(f)
-                self.model_list=json.dumps([f'"{item["urls"][0].split("/")[-1:]} : {item["urls"][0]}"' for item in self.models.values()])
+            for key in list(self.models.keys()):
+                if "オリジナル" in key:
+                    self.models.pop(key)
+            modelfiles=glob.glob("models/*.gguf")
+            known_files=[os.path.basename(item["urls"][0]) for item in self.models.values()]
+            for item in modelfiles:
+                new_modelname=os.path.basename(item)
+                if new_modelname not in known_files:
+                    self.models[f"オリジナル/{new_modelname.replace('.gguf','')}"]={
+                        "max_gpu_layer":0,
+                        "context_size":4096,
+                        "urls":[new_modelname],
+                    }
+            self.model_list=json.dumps([f'"{os.path.basename(item["urls"][0])} : {item["urls"][0]}"' for item in self.models.values()])
         else:
             self.models=None
 
@@ -46,7 +63,8 @@ class KoboldCppBackend:
             self.gscript={}
 
     def check_download(self,modelname):
-        path=f"models/{self.models[modelname]['urls'][0].split('/')[-1]}"
+        model_url=self.models[modelname]["urls"][0]
+        path=os.path.join("models", os.path.basename(model_url))
         def downloading(path:str,download_path:str):
             with requests.get(path,stream=True) as r:
                     r.raise_for_status()
@@ -57,8 +75,10 @@ class KoboldCppBackend:
                     os.replace(download_path.replace(".gguf",".part"),download_path.replace(".part",".gguf"))
         if os.path.exists(path):
             return True,path
+        elif not model_url.startswith(("http://", "https://")):
+            return False,path
         else:
-            threading.Thread(target=downloading,args=(self.models[modelname]['urls'][0],path,),daemon=True).start()
+            threading.Thread(target=downloading,args=(model_url,path,),daemon=True).start()
             return False,path
     
 
@@ -139,7 +159,7 @@ class KoboldCppBackend:
                 return str(data["data"]["text"])
             return ""
 
-    def generate_polled_stream(self, prompt: str, params: Dict) -> Iterator[str]:
+    def generate_polled_stream(self, prompt: str, params: Dict, header: str="", current_text: str="", cut_mode: str="シンプル", exepath: str="koboldcpp", max_tokens: int=1024) -> Iterator[str]:
         """
         1) 別スレッドで /api/v1/generate を投げて生成開始（ブロッキング回避）
         2) 生成中に /api/extra/generate/check をポーリングして増分を yield
@@ -152,8 +172,12 @@ class KoboldCppBackend:
             if temp in modelname:
                 template=self.temps.templates[self.temps.temp_name[temp]]
 
+        formated=self.comp_hub(cut_mode, header, current_text, template, exepath, max_tokens)
+        if self.check_over_tokens(formated)+max_tokens>0:
+            yield "Over Max Tokens"
+
         payload = {
-            "prompt": template.format(prompt),
+            "prompt": formated if current_text else template.format(prompt),
             "temperature": float(params.get("temperature", 0.7)),
             "top_k": int(params.get("top_k", 40)),
             "top_p": float(params.get("top_p", 0.95)),
@@ -241,6 +265,45 @@ class KoboldCppBackend:
                 pass
 
     # ---- Optional: start/stop koboldcpp process ----
+    def _resolve_exe(self, koboldcpp_exe: str) -> str:
+        exe = koboldcpp_exe.strip() if koboldcpp_exe else "koboldcpp.exe" if os.name == "nt" else "koboldcpp"
+        if not os.path.isabs(exe) and os.path.exists(exe) and os.name != "nt" and not exe.startswith("./"):
+            exe = "./" + exe
+        return exe
+
+    def _popen(self, cmd: list[str]) -> subprocess.Popen:
+        popen_kwargs = dict(text=True, bufsize=1)
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        return subprocess.Popen(cmd, **popen_kwargs)
+
+    def _stop_proc(self, proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                try:
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                except Exception:
+                    pass
+                proc.terminate()
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            if os.name == "nt":
+                proc.kill()
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+
     def start(self, koboldcpp_exe: str, model_path: str, layers: int = 40, port: int = 5001, context_length: int = 2048):
         """
         koboldcpp をプロセス起動したい場合用（任意）。
@@ -250,35 +313,17 @@ class KoboldCppBackend:
         if self._proc and self._proc.poll() is None:
             return "すでに起動しています。"
 
-        # 実行ファイルの解決（同ディレクトリの "koboldcpp" を想定）
-        exe = koboldcpp_exe.strip() if koboldcpp_exe else "koboldcpp"
-
-        # 相対パスの場合は "./" を付けた方が確実（LinuxでPATHに無いことが多い）
-        if not os.path.isabs(exe) and os.path.exists(exe):
-            # "koboldcpp" が同階層にあるケース
-            if os.name != "nt" and not exe.startswith("./"):
-                exe = "./" + exe
+        exe = self._resolve_exe(koboldcpp_exe)
 
         cmd = [
             exe,
-            "--model", f"models/{self.models[model_path]['urls'][0].split('/')[-1]}",
+            "--model", os.path.join("models", os.path.basename(self.models[model_path]["urls"][0])),
             "--port", str(port),
             "--gpulayers", str(layers),
             "--contextsize", str(context_length),
         ]
 
-        # OS 別にプロセスグループ（セッション）を分けて、stop() でまとめて落とせるようにする
-        popen_kwargs = dict(text=True, bufsize=1)
-
-        if os.name == "nt":
-            # Windows: 新しいプロセスグループ
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            # Linux/macOS: 新しいセッション
-            # Python 3.2+ なら start_new_session=True が一番安全
-            popen_kwargs["start_new_session"] = True
-
-        self._proc = subprocess.Popen(cmd, **popen_kwargs)
+        self._proc = self._popen(cmd)
         self.not_first_gen = False
 
         return f"起動コマンド: {' '.join(cmd)}"
@@ -288,36 +333,7 @@ class KoboldCppBackend:
             return "起動していません。"
 
         if self._proc.poll() is None:
-            try:
-                if os.name == "nt":
-                    # Windows: CTRL_BREAK → terminate → kill
-                    try:
-                        self._proc.send_signal(signal.CTRL_BREAK_EVENT)
-                    except Exception:
-                        pass
-                    self._proc.terminate()
-                else:
-                    # Linux/macOS: セッション/プロセスグループに SIGTERM
-                    # start_new_session=True の場合、pid が pgid になっているので killpg が効く
-                    try:
-                        os.killpg(self._proc.pid, signal.SIGTERM)
-                    except Exception:
-                        # killpg が効かない場合は通常 terminate
-                        self._proc.terminate()
-
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                # だめなら強制 kill
-                try:
-                    if os.name == "nt":
-                        self._proc.kill()
-                    else:
-                        try:
-                            os.killpg(self._proc.pid, signal.SIGKILL)
-                        except Exception:
-                            self._proc.kill()
-                except Exception:
-                    pass
+            self._stop_proc(self._proc)
 
         self._proc = None
         return "終了しました。"
@@ -325,3 +341,155 @@ class KoboldCppBackend:
     def reload_gscript(self,path: str):
         if os.path.exists(path):
             self.gscript=self.ssc.load_encrypt_json(path)
+
+    # ---- Context compression ----
+    def setting_aicompresser(self, exepath: str):
+        model_path=os.path.join("models", "LFM2.5-1.2B-JP-Q8_0.gguf")
+
+        def downloading(path:str,download_path:str):
+            with requests.get(path,stream=True) as r:
+                    r.raise_for_status()
+                    with open(download_path.replace(".gguf",".part"),"wb") as f:
+                        for chunk in r.iter_content(chunk_size=1024*1024):
+                            if chunk:
+                                f.write(chunk)
+                    os.replace(download_path.replace(".gguf",".part"),download_path)
+
+        if not os.path.exists(model_path):
+            result=threading.Thread(
+                target=downloading,
+                args=("https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-GGUF/resolve/main/LFM2.5-1.2B-JP-Q8_0.gguf?download=true", model_path),
+                daemon=True,
+            )
+            result.start()
+            result.join(timeout=300)
+
+        if self.comp_proc and self.comp_proc.poll() is None:
+            return "すでに起動しています。"
+
+        exe=self._resolve_exe(exepath)
+        if not os.path.exists(exe.replace("./", "", 1)) and not os.path.exists(exe):
+            return f"{exe} が見つかりません"
+
+        cmd = [
+            exe,
+            "--model", model_path,
+            "--port", "5015",
+            "--gpulayers", "0",
+            "--contextsize", "2048",
+        ]
+        self.comp_proc = self._popen(cmd)
+        return "起動完了"
+
+    def stop_aicompesser(self):
+        if not self.comp_proc:
+            return "起動していません。"
+        if self.comp_proc.poll() is None:
+            self._stop_proc(self.comp_proc)
+        self.comp_proc = None
+        return "終了しました。"
+
+    def send_aicompresser(self,text: str):
+        payload = {
+            "prompt": "以下の文章を3文以内で要約してください。\n"+text,
+            "temperature": 0.7,
+            "top_k": 40,
+            "top_p": 0.95,
+            "rep_pen": 1.1,
+            "max_length": 256,
+        }
+
+        candidates = [
+            "/api/v1/generate",
+            "/api/v1/generate/text",
+            "/api/generate",
+        ]
+
+        last_err: Optional[Exception] = None
+        for p in candidates:
+            try:
+                url = "http://127.0.0.1:5015"+p
+                r = requests.post(url, json=payload, timeout=self.config.timeout_sec)
+                r.raise_for_status()
+                data = r.json()
+                text_result = self._extract_text_from_generate_resp(data)
+                if text_result:
+                    return text_result
+                raise RuntimeError(f"未知のレスポンス形式: {json.dumps(data, ensure_ascii=False)[:400]}")
+            except Exception as e:
+                last_err = e
+
+        raise RuntimeError(f"生成APIに接続できませんでした。base_url=http://127.0.0.1:5015 / err={last_err}")
+
+    def check_over_tokens(self,text: str):
+        token_values=int(self._post_json("/api/extra/tokencount",{"prompt":text})["value"])
+        true_max_context_length=int(self._get_none("/api/extra/true_max_context_length")["value"])
+        print(f"check current token {token_values}/{true_max_context_length}")
+        return token_values-true_max_context_length
+
+    def check_current_token(self,text: str):
+        return int(self._post_json("/api/extra/tokencount",{"prompt":text})["value"])
+
+    def simple_compresser(self,texts:list[str], header: str, template: str, max_tokens: int):
+        over=True
+        formated=template.format(header + "\n".join(texts))
+        over_length=self.check_over_tokens(formated)+max_tokens
+        current_length=max(self.check_current_token("\n".join(texts)), 1)
+        first_sentence=max(int(len(texts)*over_length/current_length), 0)
+        while over and first_sentence < len(texts):
+            new_texts=texts[first_sentence:]
+            if self.check_over_tokens(template.format(header + "\n".join(new_texts)))+max_tokens<0:
+                over=False
+            else:
+                first_sentence+=1
+        return "\n".join(texts[first_sentence:])
+
+    def ai_compresser(self,texts:list[str], header: str, template: str, max_tokens: int):
+        n = 20
+        chunks = [texts[i:i + n] for i in range(0, len(texts), n)]
+        if self.comp_proc and self.comp_proc.poll() is None:
+            pass
+        else:
+            print(self.setting_aicompresser(exepath=self.config.kobold_path))
+            def is_listening(host: str="127.0.0.1",port: int = 5015, timeout: float =0.3)-> bool:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(timeout)
+                        return s.connect_ex((host, port)) == 0
+            deadline=time.time()+300
+            while not is_listening() and time.time()<deadline:
+                time.sleep(0.1)
+        over=True
+        current_index=0
+        comped_chunks=[]
+        while over and current_index < len(chunks):
+            comped_chunks.append(self.send_aicompresser("\n".join(chunks[current_index])))
+            new_raw_text=""
+            for item in comped_chunks:
+                new_raw_text+=item
+            for item in chunks[len(comped_chunks):]:
+                new_raw_text+="\n".join(item)
+            new_texts=template.format(header + new_raw_text)
+            length=self.check_over_tokens(new_texts)
+            if length+max_tokens<0:
+                over=False
+            current_index+=1
+        return new_raw_text
+
+    def comp_hub(self,mode: str,header: str, current_text:str, template: str,exepath: str, max_tokens: int):
+        formatted=template.format(header+current_text)
+        if self.check_over_tokens(formatted)+max_tokens<0:
+            return formatted
+        texts=current_text.split("\n")
+        mode_dict={
+            "シンプル":1,
+            "AI圧縮":2,
+        }
+        match mode_dict.get(mode, 1):
+            case 1:
+                self.stop_aicompesser()
+                result=self.simple_compresser(texts,header,template,max_tokens)
+            case 2:
+                result=self.ai_compresser(texts,header,template,max_tokens)
+            case _:
+                result=""
+        return template.format(header+result)

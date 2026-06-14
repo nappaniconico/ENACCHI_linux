@@ -13,8 +13,62 @@ import random
 import subprocess
 import re
 import argparse
+import shutil
 
 import gradio as gr
+
+
+def is_pyinstaller_bundle() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def prepare_runtime_environment() -> None:
+    if is_pyinstaller_bundle():
+        app_dir = pathlib.Path(sys.executable).resolve().parent
+        bundled_dir = pathlib.Path(getattr(sys, "_MEIPASS", app_dir))
+    else:
+        app_dir = pathlib.Path(__file__).resolve().parent
+        bundled_dir = app_dir
+
+    os.chdir(app_dir)
+
+    for source, destination in [
+        (bundled_dir / "models" / "llm.json", app_dir / "models" / "llm.json"),
+        (bundled_dir / "gscript.json", app_dir / "gscript.json"),
+    ]:
+        if source.exists() and not destination.exists():
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+
+
+def update_enacchi() -> bool:
+    if not os.path.exists(".git"):
+        return False
+
+    git_cmd = shutil.which("git")
+    if git_cmd is None:
+        portable_git = os.path.join("temp_git", "PortableGit", "cmd", "git.exe")
+        git_cmd = portable_git if os.path.exists(portable_git) else None
+    if git_cmd is None:
+        return False
+
+    result=subprocess.run(
+        [git_cmd, "pull"],
+        cwd=".",
+        capture_output=True,
+        text=True,
+    )
+
+    uv_cmd = shutil.which("uv")
+    if uv_cmd is not None:
+        subprocess.run(
+            [uv_cmd, "sync"],
+            cwd=".",
+            capture_output=True,
+            text=True,
+        )
+
+    return result.returncode == 0
 
 
 
@@ -63,19 +117,19 @@ def _build_prompt(title: str, genre: str, characters: str, background: str, addi
     parts = []
     
     if free_instr.strip():
-        parts.append(f"/【指示】/{free_instr.strip()}\n")
+        parts.append(f"/【指示】/\n{free_instr.strip()}\n")
     else:
-        parts.append("/【指示】/特になし\n")
+        parts.append("/【指示】/\n以下の設定に従って文章の続きを生成せよ\n")
 
     if title.strip():
-        parts.append(f"/【タイトル】/{title.strip()}\n")
+        parts.append(f"/【タイトル】/\n{title.strip()}")
     else:
-        parts.append("/【タイトル】/特になし\n")
+        parts.append("/【タイトル】/\n特になし")
 
     if genre.strip():
-        parts.append(f"/【ジャンル】/{genre.strip()}\n")  
+        parts.append(f"/【ジャンル】/\n{genre.strip()}")  
     else:
-        parts.append("/【ジャンル】/特になし\n")  
+        parts.append("/【ジャンル】/\n特になし")  
 
     if characters.strip():
         parts.append(f"/【登場人物】/\n{characters.strip()}")  
@@ -88,9 +142,9 @@ def _build_prompt(title: str, genre: str, characters: str, background: str, addi
         parts.append("/【舞台背景】/\n特になし") 
 
     if additional.strip():
-        parts.append(f"/【{additional.strip()}】/")
+        parts.append(f"/【続きのストーリー展開】/\n{additional.strip()}")
     else:
-        parts.append("/【特になし】/")
+        parts.append("/【続きのストーリー展開】/\n自由に展開せよ")
 
     if current_text.strip():
         parts.append(f"/【本文】/\n{current_text.strip()}")
@@ -116,6 +170,7 @@ def build_ui() -> gr.Blocks:
         gscripts_state=gr.State(backend.gscript)
         gsc_edit_state=gr.State({}) #dict
         gsc_edit_state_text=gr.State([]) #List[str]
+        git_state=gr.State(False)
 
         with gr.Row():
             gr.Markdown("# Easy Novel Assistant OsuChitsu")
@@ -159,6 +214,7 @@ def build_ui() -> gr.Blocks:
                         repeat_penalty = gr.Slider(0, 2.0, value=1.1, step=0.1, label="repeat_penalty", interactive=True, info="このパラメータが高いほど同じ文章の繰り返しを抑制します。")
                         
                         max_new_tokens = gr.Slider(64, 2048, value=512, step=32, label="max_new_tokens", interactive=True,info="1度に生成する文章量を決定します。")
+                        cut_mode=gr.Radio(["AI圧縮","シンプル"],label="context長圧縮方式",interactive=True,value="シンプル")
                         
 
                     with gr.TabItem("KoboldCpp"):
@@ -172,7 +228,7 @@ def build_ui() -> gr.Blocks:
                         )
                             info = gr.Markdown("以下のパラメータは使用するPCのビデオメモリ、メインメモリを確認しながら調整してください<br>許容値を超えた場合、起動に失敗することがあります")
                             new_layer= backend.models[model_list[0]]["max_gpu_layer"]
-                            layers= gr.Slider(0, new_layer, value=new_layer, step=1, label="layers",info="大きいほどGPUを重点的に使用します。\nビデオメモリが小さい場合は小さくしてください。\nCPU生成の場合は0にしてください。")
+                            layers= gr.Slider(-1, new_layer, value=-1, step=1, label="layers",info="大きいほどGPUを重点的に使用します。\nビデオメモリが小さい場合は小さくしてください。\nCPU生成の場合は0にしてください。")
                             
                         else:
                             model_choice = gr.Dropdown(
@@ -181,7 +237,7 @@ def build_ui() -> gr.Blocks:
                             interactive=True
                         )
                             info = gr.Markdown("以下のパラメータは使用するPCのビデオメモリ、メインメモリを確認しながら調整してください<br>許容値を超えた場合、起動に失敗することがあります")
-                            layers = gr.Slider(0, 50, value=40, step=1, label="layers",info="大きいほどGPUを重点的に使用します。\nビデオメモリが小さい場合は小さくしてください。\nCPU生成の場合は0にしてください。")
+                            layers = gr.Slider(-1, 0, value=-1, step=1, label="layers",info="大きいほどGPUを重点的に使用します。\nビデオメモリが小さい場合は小さくしてください。\nCPU生成の場合は0にしてください。")
                         
                         context_length = gr.Slider(2048, 20480, value=2048, step=2048, label="context_length", interactive=True,info="LLMが参照できる文章量を指定します。長編や設定の細かい作品では大きくしてください。\nビデオメモリが小さい場合は小さくしてください。")
                         with gr.Row():
@@ -201,7 +257,8 @@ def build_ui() -> gr.Blocks:
                         imjson=gr.Button("設定＋出力をjsonファイルから読み込む")
                         uploadfile=gr.File(visible="hidden",interactive=True)
                         file_status=gr.Markdown("           下の青い文字を押してダウンロードしてください",visible="hidden")
-                        downloadfile=gr.File(visible="hidden",interactive=False,show_label=False)                       
+                        downloadfile=gr.File(visible="hidden",interactive=False,show_label=False)
+                        update_button=gr.Button("アプリの更新",variant="secondary",visible=not is_pyinstaller_bundle())
                         exit_button=gr.Button("アプリ終了",variant="stop")
                     
                     with gr.TabItem("ガタライズスクリプト作成"):
@@ -253,7 +310,12 @@ def build_ui() -> gr.Blocks:
             backend.config.base_url = new_url
             return f"base_url を {new_url} に設定しました。"
 
+        def on_change_kobold_path(new_path: str):
+            backend.config.kobold_path=new_path
+            return None
+
         base_url.change(on_change_base_url, inputs=[base_url], outputs=[status])
+        koboldcpp_exe.change(on_change_kobold_path,inputs=[koboldcpp_exe],outputs=[])
 
 
         def on_retry_stream(
@@ -271,12 +333,15 @@ def build_ui() -> gr.Blocks:
             max_new_tokens: int,
             before: str,
             replace:bool=False,
-            replacelist:dict={}
+            replacelist:dict={},
+            cut_mode: str="シンプル",
+            exepath: str="koboldcpp"
         ):
             # undo 用に、生成前を保存（redoはクリア）
             #undo_stack, redo_stack = _push_history(current_text, undo_stack, redo_stack)
         
             prompt = _build_prompt(title,genre,characters,background, additional, free_instr, current_text)
+            header = _build_prompt(title,genre,characters,background, additional, free_instr, "")
             params = {
                 "temperature": temperature,
                 "top_k": top_k,
@@ -293,7 +358,7 @@ def build_ui() -> gr.Blocks:
         
             try:
                 first=True
-                for delta in backend.generate_polled_stream(prompt, params):
+                for delta in backend.generate_polled_stream(prompt, params, header, current_text, cut_mode, exepath, max_new_tokens):
                     if first and base != "":
                         first=False
                         continue
@@ -303,6 +368,9 @@ def build_ui() -> gr.Blocks:
                         continue
                     acc += delta
                     acc=tail_ereaser(acc,r'【.*?】')
+                    if "Over Max Tokens" in acc:
+                        gr.Info("最大context長を超過しています。\ncontext長圧縮方式を「シンプル」に変更してください。")
+                        acc=tail_ereaser(acc,"Over Max Tokens")
                     yield {output_display:base+acc}
             except Exception as e:
                 yield acc + f"\n\n[ERROR] streaming failed: {e}\n"
@@ -317,14 +385,18 @@ def build_ui() -> gr.Blocks:
         
 
         retry_btn.click(_push_history,inputs=[output_display,undo_stack,redo_stack],outputs=[undo_stack,redo_stack]).then(
+            lambda x:gr.update(interactive=False),inputs=[output_display],outputs=[output_display]
+        ).then(
             on_retry_stream,
             inputs=[
                 output_display,
-                characters, title, genre,background,additional, free_instr,
+                title, genre, characters, background,additional, free_instr,
                 temperature, top_k, top_p, repeat_penalty, max_new_tokens,
-                doc_state,replace_token,gscripts_state
+                doc_state,replace_token,gscripts_state,cut_mode,koboldcpp_exe
             ],
             outputs=[output_display],
+        ).then(
+            lambda x:gr.update(interactive=True),inputs=[output_display],outputs=[output_display]
         )
 
         def on_undo(current_text: str, undo_stack: List[str], redo_stack: List[str]):
@@ -387,8 +459,11 @@ def build_ui() -> gr.Blocks:
                 return f"終了失敗: {e}"
         
         def load_model_config(modelname):
-            new_layer= backend.models[modelname]["max_gpu_layer"]
-            return gr.Slider(1, new_layer, value=new_layer, step=1, label="layers",info="大きいほどGPUを重点的に使用します。ビデオメモリが小さい場合やCPUで生成したい場合は小さくしてください。")
+            if modelname in backend.models.keys():
+                new_layer= backend.models[modelname]["max_gpu_layer"]
+            else:
+                new_layer=0
+            return gr.Slider(-1, new_layer, value=-1, step=1, label="layers",info="大きいほどGPUを重点的に使用します。ビデオメモリが小さい場合やCPUで生成したい場合は小さくしてください。")
         
         def on_exit():
             """
@@ -399,6 +474,7 @@ def build_ui() -> gr.Blocks:
             # 先に koboldcpp を止める（あなたの backend.stop() を使う）
             try:
                 backend.stop()
+                backend.stop_aicompesser()
             except Exception:
                 pass
             
@@ -414,6 +490,13 @@ def build_ui() -> gr.Blocks:
             threading.Thread(target=_shutdown_later, daemon=True).start()
 
             return "アプリを終了しました\nこの画面を閉じてください"
+
+        def on_restart(updated: bool,currenttext: str):
+            if updated:
+                on_exit()
+                return"アプリを終了しました\nこの画面を閉じて再度起動してください"
+            else:
+                return currenttext
         
         def export_txt(text:str):
             os.makedirs("output",exist_ok=True)
@@ -455,7 +538,7 @@ def build_ui() -> gr.Blocks:
                 json.dump(datas,f,ensure_ascii=False)
             return filename
         
-        def import_json(path:str):
+        def import_json(path:str,currentmodel: str):
             if os.path.exists(path):
                 with open(path,mode="r",encoding="utf-8")as f:
                     datas=json.load(f)
@@ -464,10 +547,18 @@ def build_ui() -> gr.Blocks:
                         kobo=datas["llamacpp"]
                     else:
                         kobo=datas["koboldcpp"]
+                    if kobo["modelname"] in backend.models.keys():
+                        modelname=kobo["modelname"]
+                        modellayer=kobo["layers"]
+                        modelcontext=kobo["context"]
+                    else:
+                        modelname=currentmodel
+                        modellayer=0
+                        modelcontext=2048
                     dolist=datas["dolist"]
                     return datas["main"],datas["title"],datas["genre"],datas["characters"],datas["background"],datas["add"],datas["inst"],\
-                        param["temp"],param["top_k"],param["top_p"],param["repeat"],param["tokens"],kobo["modelname"],kobo["layers"],\
-                            kobo["context"],dolist["undo"],dolist["redo"]
+                        param["temp"],param["top_k"],param["top_p"],param["repeat"],param["tokens"],modelname,modellayer,\
+                            modelcontext,dolist["undo"],dolist["redo"]
             else:
                 return "","","","","","","",1.0,40,0.95,1.1,64,"",30,2048,[],[]
         
@@ -509,6 +600,7 @@ def build_ui() -> gr.Blocks:
         stop_btn.click(on_stop, inputs=[], outputs=[status])
         model_choice.change(load_model_config,inputs=[model_choice],outputs=[layers])
         exit_button.click(on_exit,inputs=[],outputs=[output_display])
+        update_button.click(update_enacchi,inputs=[],outputs=[git_state]).then(on_restart,inputs=[git_state,output_display],outputs=[output_display])
         extxt.click(export_txt,inputs=[output_display],outputs=[downloadfile]).then(lambda x:gr.update(visible=True),
                                                                         inputs=[file_status],outputs=[file_status]).then(lambda x:gr.update(visible=True),
                                                                                                                         inputs=[downloadfile],outputs=[downloadfile])
@@ -520,7 +612,7 @@ def build_ui() -> gr.Blocks:
                         ).then(
                             lambda x:gr.update(visible=True),inputs=[downloadfile],outputs=[downloadfile])
         imjson.click(lambda x:gr.File(value=None,visible=True),inputs=[uploadfile],outputs=[uploadfile])
-        uploadfile.upload(import_json,inputs=[uploadfile],outputs=[output_display,
+        uploadfile.upload(import_json,inputs=[uploadfile,model_choice],outputs=[output_display,
                     title,genre,characters,background,additional,free_instr,temperature,top_k,top_p,repeat_penalty,max_new_tokens,model_choice,layers,context_length,undo_stack,redo_stack]).\
                         then(lambda x:gr.File(value=None,visible="hidden"),inputs=[uploadfile],outputs=[uploadfile])
         downloadfile.download(lambda x:gr.update(visible="hidden"),inputs=[file_status],outputs=[file_status])
@@ -535,10 +627,17 @@ def cleanup():
                 file.unlink()
 
 def ensure_koboldcpp():
-    path="./koboldcpp"
     if os.name == "nt":
-        pass
+        path="./koboldcpp.exe"
+        if os.path.exists(path):
+            return "koboldcpp.exe は既に存在します"
+        url = "https://github.com/LostRuins/koboldcpp/releases/latest/download/koboldcpp.exe"
+
+        subprocess.run(["curl", "-fLo", "koboldcpp.exe", url], check=True)
+
+        return "koboldcpp.exe をダウンロードしました"
     else:
+        path="./koboldcpp"
         # Linux/macOS
         if os.path.exists(path):
             return "koboldcpp は既に存在します"
@@ -557,6 +656,7 @@ def print_message(text: str):
     return None
 
 def main(colab: bool):
+    prepare_runtime_environment()
     signal.signal(signal.SIGTERM,signal_handler)
     try:
         ensure_koboldcpp()
